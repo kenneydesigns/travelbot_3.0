@@ -1,0 +1,353 @@
+import os
+import re
+import argparse
+import logging
+import json
+from datetime import datetime
+from langchain.chains import RetrievalQA
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.llms import LlamaCpp
+
+# --- Configuration ---
+MODEL_PATH = "/home/travelbot/travelbot_3.0/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+SAMPLE_QUESTIONS_FILE = "sample_questions.txt"
+
+SOURCE_VERSION_MAP = {
+    "jtr_mar2025_chunk0.txt": "JTR (March 2025)",
+    "afman65-114_chunk0.txt": "AFMAN 65-114",
+    "dafi36-3003_chunk0.txt": "DAFI 36-3003"
+}
+
+# Improve Question Interpretation
+def categorize_question(query):
+    FILTER_KEYWORDS = {
+        "home of record": [
+        "home of record",
+        "correct home of record",
+        "place originally named",
+        "bona fide error",
+        "home of selection"
+    ],
+    "real estate": [
+        "real estate expenses",
+        "residence sale",
+        "residence purchase",
+        "reimbursable expenses",
+        "broker’s fees",
+        "closing costs",
+        "mortgage document",
+        "unexpired lease settlement",
+        "dd form 1705",
+        "title document"
+    ],
+    "mobile home": [
+        "mobile home transportation",
+        "instead of hhg",
+        "constructed cost",
+        "geographic limitations",
+        "advance payment for mobile home",
+        "government’s liability",
+        "table 5-58"
+    ],
+    "temporary lodging": [
+        "temporary lodging",
+        "tqse",
+        "temporary quarters subsistence",
+        "dd form 2912",
+        "authorized time period",
+        "travel time exclusions",
+        "occupancy period",
+        "supporting statement"
+    ],
+    "house hunting": [
+        "house hunting",
+        "pre-separation travel",
+        "job search",
+        "relocation activity",
+        "ptdy for transition",
+        "terminal leave with job search"
+    ],
+    "general pcs": [
+        "concurrent travel",
+        "separation or retirement",
+        "change of pds",
+        "permanent duty station",
+        "authorized allowances",
+        "en route leave"
+    ]
+}
+    # Add more if you like
+
+    QUESTION_CATEGORIES = {
+        "gtc": ["gtc", "government travel card", "credit card"],
+        "voucher_status": ["check status", "voucher status", "payment status"],
+        "lodging": ["lodging", "hotel", "housing"],
+        "flights": ["flight", "plane ticket", "airfare"],
+        "receipts": ["receipt", "proof of payment"],
+    }
+    for category, keywords in QUESTION_CATEGORIES.items():
+        if any(keyword in query.lower() for keyword in keywords):
+            return category
+    return "general"
+
+def expand_query_context(category):
+    context_map = {
+        "gtc": "The user is asking about their Government Travel Card (GTC). ",
+        "voucher_status": "The user is trying to check the status of their travel voucher. ",
+        "lodging": "This question relates to lodging arrangements during official travel. ",
+        "flights": "This is about scheduling or booking flights for TDY or PCS. ",
+        "receipts": "The user wants to know about submitting or tracking receipts. ",
+        "general": ""
+    }
+    return context_map.get(category, "")
+
+def expand_keywords(prompt, llm=None):
+    """Extract main and related terms from the query using predefined keyword filters."""
+    lower_prompt = prompt.lower()
+    matched_keywords = []
+    related_terms = []
+
+    for category, keywords in FILTER_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword in lower_prompt:
+                matched_keywords.append(keyword)
+                related_terms.extend([kw for kw in keywords if kw != keyword])
+
+    # Deduplicate
+    matched_keywords = list(set(matched_keywords))
+    related_terms = list(set(related_terms))
+
+    return {
+        "keywords": matched_keywords,
+        "related_terms": related_terms
+    }
+
+# --- Dynamic Keyword Filters for RAG ---
+FILTER_KEYWORDS = {
+    "home of record": [
+        "home of record", "correct home of record", "place originally named", "bona fide error", "home of selection"
+    ],
+    "real estate": [
+        "real estate expenses", "residence sale", "residence purchase", "reimbursable expenses",
+        "broker’s fees", "closing costs", "mortgage document", "unexpired lease settlement",
+        "dd form 1705", "title document"
+    ],
+    "mobile home": [
+        "mobile home transportation", "instead of hhg", "constructed cost", "geographic limitations",
+        "advance payment for mobile home", "government’s liability", "table 5-58"
+    ],
+    "temporary lodging": [
+        "temporary lodging", "tqse", "temporary quarters subsistence", "dd form 2912",
+        "authorized time period", "travel time exclusions", "occupancy period", "supporting statement"
+    ],
+    "house hunting": [
+        "house hunting", "pre-separation travel", "job search", "relocation activity",
+        "ptdy for transition", "terminal leave with job search"
+    ],
+    "general pcs": [
+        "concurrent travel", "separation or retirement", "change of pds",
+        "permanent duty station", "authorized allowances", "en route leave"
+    ]
+}
+
+# --- PII/OPSEC Detection ---
+def detect_pii_or_opsec(text):
+    safe_context_words = ["location", "airport", "TDY", "PCS", "JTR"]
+    if any(word.lower() in text.lower() for word in safe_context_words):
+        return False
+
+    patterns = [
+        r"\b\d{3}-\d{2}-\d{4}\b",       # SSN
+        r"\b\d{10}\b",                  # 10-digit phone number
+        r"\(\d{3}\)\s*\d{3}-\d{4}",     # (123) 456-7890
+        r"\b\d{2}[-/]\d{2}[-/]\d{4}\b", # DOB
+        r"\b[A-Z]{2,6}\d{4,7}\b",       # DoD ID or tail number
+        r"\b(classified|secret|OPSEC|grid ref|coordinates)\b"
+    ]
+
+    for pattern in patterns:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+
+    capitalized_words = re.findall(r"\b[A-Z][a-z]+\b", text)
+    if len(capitalized_words) >= 2:
+        for i in range(len(capitalized_words) - 1):
+            pattern = f"{capitalized_words[i]} {capitalized_words[i+1]}"
+            if re.search(rf"\b{re.escape(pattern)}\b", text):
+                return True
+
+    return False
+
+# --- Model and Retriever Setup ---
+def load_model_and_retriever():
+    try:
+        # logger.info("🦙 Loading TinyLLaMA model with LlamaCpp...")
+        llm = LlamaCpp(
+            model_path=MODEL_PATH, # Path to the pre-trained model file.
+            n_ctx=2048, # Maximum number of tokens the model can process in a single context.
+                        # Ensure this aligns with your application's requirements and the model's capabilities.
+            n_threads=4, # Adjust based on your CPU's core count to optimize performance.
+            n_gpu_layers = 1,  # Adjust based on your GPU's capacity
+            n_batch = 512,  # Ensure this fits within your GPU memory constraints
+            temperature=0.7, # increase randomness. Adjust based on the desired creativity of the output.
+            verbose=True, # Whether to print detailed logs during model operations.
+            f16_kv = True  # Enabling this can reduce memory usage and potentially increase speed
+        )
+     # Load chunks and build retriever
+        chunk_data = load_jsonl_chunks(
+    os.path.join(PROJECT_ROOT, "rag/jtr_chunks/jtr.jsonl"),
+    os.path.join(PROJECT_ROOT, "rag/jtr_chunks/dafi.jsonl")
+)
+        retriever = get_simple_retriever(chunk_data)
+
+        return llm, retriever
+    except Exception as e:
+        raise RuntimeError(f"❌ Failed to load model or retriever: {e}")
+    
+        
+def load_jsonl_chunks(*paths):
+    all_chunks = []
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                data = json.loads(line)
+                # 🔁 Normalize 'text' to 'content'
+                if "content" not in data and "text" in data:
+                    data["content"] = data.pop("text")
+                all_chunks.append(data)
+    return all_chunks
+
+
+def get_simple_retriever(chunks):
+    from langchain.schema import Document
+    from langchain.vectorstores import FAISS
+
+    documents = [
+        Document(page_content=chunk["content"], metadata={"source": chunk["chunk_id"], **chunk.get("metadata", {})})
+        for chunk in chunks
+    ]
+
+    embedding_fn = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    db = FAISS.from_documents(documents, embedding_fn)
+    return db.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+
+chunk_data = load_jsonl_chunks(
+    os.path.join(PROJECT_ROOT, "rag/jtr_chunks/jtr.jsonl"),
+    os.path.join(PROJECT_ROOT, "rag/jtr_chunks/dafi.jsonl")
+)
+
+retriever = get_simple_retriever(chunk_data)
+
+
+# --- Formatting Results ---
+def format_sources(retrieved):
+    labels = set()
+    for doc in retrieved:
+        fname = doc.metadata["source"]
+        label = SOURCE_VERSION_MAP.get(fname, fname.split("_chunk")[0])
+        labels.add(label)
+    return "\n".join(f"- {label}" for label in sorted(labels))
+
+# --- Hybrid LLM + RAG Response ---
+def hybrid_response(query, llm, retriever, feedback_score=None, mode="ui"):
+    if detect_pii_or_opsec(query):
+        return "⚠️ Input may contain sensitive information. Please rephrase your question."
+
+    if len(query.strip().split()) <= 3:
+        return "🤔 Could you provide more detail about your question so I can give you the most accurate answer?"
+    # Step 0: preprocess query
+    category = categorize_question(query)
+    contextual_hint = expand_query_context(category)
+
+    context_hint = (
+        "Answer clearly and concisely. Use a helpful tone. Include citations if appropriate."
+    )
+    pre_prompt = f"{contextual_hint}The user asked: '{query}'. Please explain in a helpful and detailed way."
+    full_prompt = context_hint + "\n\n" + pre_prompt
+    
+    # Step 1: Retrieve baseline documents
+    retrieved_docs = retriever.invoke(query)
+
+    # Step 2: Use TinyLLaMA to expand keywords
+    expansion = expand_keywords(query, llm)
+    all_terms = [t.lower() for t in expansion["keywords"] + expansion["related_terms"]]
+
+    # Step 3: Filter to documents that match expanded terms
+    filtered_docs = [
+        doc for doc in retrieved_docs
+        if any(term in doc.page_content.lower() for term in all_terms)
+    ]
+    if filtered_docs:
+        retrieved_docs = filtered_docs
+
+    # Step 4: General fallback for unmatched queries with agency guidance
+    if not retrieved_docs:
+        if "home of record" in query.lower():
+            agency = "your **Military Personnel Flight (MPF)**"
+        elif any(term in query.lower() for term in ["voucher", "dts", "reimbursement", "entitlement", "per diem", "gtc"]):
+            agency = "your **Financial Services Office (FSO)**"
+        elif any(term in query.lower() for term in ["household goods", "hhg", "shipment", "storage", "moving"]):
+            agency = "your **Traffic Management Office (TMO)**"
+        elif any(term in query.lower() for term in ["leave", "orders", "assignment", "pcs orders"]):
+            agency = "your **MPF**"
+        else:
+            agency = "your **unit leadership or appropriate support agency**"
+
+        return (
+            f"{context_hint}\n\n🧭 I couldn’t find a specific regulation that matches your question. "
+            f"You may want to consult {agency} or refer to the Joint Travel Regulations (JTR) or DAFI 36-3003 for further guidance.\n\n"
+            "---\nSources:\nNone"
+        )
+
+    responses = []
+    for doc in retrieved_docs:
+        fname = doc.metadata.get("source", "default_filename")
+        chapter = doc.metadata.get("chapter", "the relevant chapter")
+        source = SOURCE_VERSION_MAP.get(fname, fname.split("_chunk")[0])
+
+    summary_prompt = (
+        "In 1–2 sentences, summarize this regulation using plain language. "
+        "Tag it as either an 'Entitlement', 'Restriction', or 'Requirement' at the start. "
+        "Only include what a military traveler needs to know.\n\n"
+        f"{doc.page_content}"
+        
+    )
+    summary = llm.invoke(summary_prompt).strip()
+
+    response = (
+        f"📘 According to **{source}**, {chapter}:\n\n"
+        f"📝 {summary}\n\n"
+        # f"📄 Original Text:\n{doc.page_content.strip()}\n"
+        f"{'-'*60}"
+    )
+    responses.append(response)
+
+    # Combine responses after loop
+    final_response = "\n\n".join(responses)
+    print("\nAnswer:\n", final_response)
+
+    return final_response
+
+# --- CLI ---
+def run_cli(llm, retriever):
+    print("✈️ AF TravelBot is ready. Ask your JTR/DAFI questions.")
+    print("[SECURITY NOTICE] Do not enter names, SSNs, DOBs, addresses, or OPSEC info.")
+    while True:
+        query = input("\n> ")
+        if query.lower() in ["exit", "quit"]:
+            break
+        result = hybrid_response(query, llm, retriever)
+        
+
+# --- Entry Point ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="AF TravelBot CLI")
+    parser.add_argument("--mode", choices=["friendly", "raw"], default="friendly", help="Choose response style.")
+    args = parser.parse_args()
+
+    llm, retriever = load_model_and_retriever()
+    run_cli(llm, retriever)
